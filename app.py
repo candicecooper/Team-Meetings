@@ -1,7 +1,7 @@
 import streamlit as st
 from supabase import create_client
 import datetime
-import anthropic
+from groq import Groq
 import json
 
 # ── Page config ──────────────────────────────────────────────────────────────
@@ -11,7 +11,7 @@ st.set_page_config(page_title="CLC Team Meetings", page_icon="👥", layout="wid
 SUPABASE_URL = st.secrets["SUPABASE_URL"]
 SUPABASE_KEY = st.secrets["SUPABASE_KEY"]
 ADMIN_PASSWORD = st.secrets.get("ADMIN_PASSWORD", "CLC2026admin")
-ANTHROPIC_KEY  = st.secrets.get("ANTHROPIC_API_KEY", "")
+GROQ_KEY = st.secrets.get("GROQ_API_KEY", "")
 
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
@@ -50,10 +50,10 @@ def admin_login():
                 st.rerun()
 
 def improve_with_ai(raw_text: str, program: str, meeting_date: str) -> str:
-    """Use Claude to improve meeting minutes from raw transcript."""
-    if not ANTHROPIC_KEY:
+    """Use Groq to improve meeting minutes from raw transcript."""
+    if not GROQ_KEY:
         return raw_text
-    client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+    client = Groq(api_key=GROQ_KEY)
     prompt = f"""You are a professional minute-taker for an alternative education school (Cowandilla Learning Centre, Learning & Behaviour Unit).
 
 Program team: {PROGRAMS[program]['label']} ({program})
@@ -73,12 +73,12 @@ Format requirements:
 Raw input:
 {raw_text}"""
 
-    response = client.messages.create(
-        model="claude-sonnet-4-20250514",
-        max_tokens=4000,
-        messages=[{"role": "user", "content": prompt}]
+    response = client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=4000
     )
-    return response.content[0].text
+    return response.choices[0].message.content
 
 # ── DB helpers ────────────────────────────────────────────────────────────────
 def fetch(table, filters=None, order=None):
