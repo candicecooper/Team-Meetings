@@ -17,9 +17,11 @@ supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 PROGRAMS = {
-    "JP": {"label": "Junior Primary",  "color": "#2d7d4f", "light": "#d1fae5", "emoji": "🟢"},
-    "PY": {"label": "Primary Years",   "color": "#1a4d8c", "light": "#dbeafe", "emoji": "🔵"},
-    "SY": {"label": "Senior Years",    "color": "#7c3aed", "light": "#ede9fe", "emoji": "🟣"},
+    "JP":    {"label": "Junior Primary",  "color": "#2d7d4f", "light": "#d1fae5", "emoji": "🟢"},
+    "PY":    {"label": "Primary Years",   "color": "#1a4d8c", "light": "#dbeafe", "emoji": "🔵"},
+    "SY":    {"label": "Senior Years",    "color": "#7c3aed", "light": "#ede9fe", "emoji": "🟣"},
+    "STAFF": {"label": "Staff Meetings",  "color": "#1e6f75", "light": "#ccfbf1", "emoji": "👥"},
+    "ADMIN": {"label": "Admin Meetings",  "color": "#92400e", "light": "#fef3c7", "emoji": "🏢"},
 }
 
 DAYS_OF_WEEK = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
@@ -518,11 +520,16 @@ def main():
     admin_login()
 
     # ── Header ──
+    grad_end = {
+        "JP": "#3fa86a", "PY": "#2a6fd4", "SY": "#9b59b6",
+        "STAFF": "#2a9fa8", "ADMIN": "#c97b1a"
+    }.get(program, "#2a6fd4")
+
     st.markdown(f"""
-    <div style="background:linear-gradient(135deg,{prog_info['color']},{'#3fa86a' if program=='JP' else '#2a6fd4' if program=='PY' else '#9b59b6'});
+    <div style="background:linear-gradient(135deg,{prog_info['color']},{grad_end});
                 padding:1.5rem 2rem;border-radius:16px;margin-bottom:1.5rem;">
       <div style="font-size:2.5rem;margin-bottom:0.25rem;">{prog_info['emoji']}</div>
-      <h1 style="color:white;margin:0;font-size:1.8rem;">{prog_info['label']} Team Meetings</h1>
+      <h1 style="color:white;margin:0;font-size:1.8rem;">{prog_info['label']}</h1>
       <p style="color:rgba(255,255,255,0.85);margin:0.25rem 0 0;">Cowandilla Learning Centre · LBU</p>
     </div>
     """, unsafe_allow_html=True)
