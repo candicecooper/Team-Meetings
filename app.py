@@ -32,6 +32,59 @@ def get_program_from_params():
     prog = params.get("program", "JP")
     return prog if prog in PROGRAMS else "JP"
 
+def get_week_from_params():
+    """Return a (week_start, week_end) date tuple if ?week= param present, else None."""
+    week_str = st.query_params.get("week", None)
+    if not week_str:
+        return None
+    try:
+        monday = datetime.date.fromisoformat(week_str)
+        # Normalise to Monday in case a non-Monday date was passed
+        monday = monday - datetime.timedelta(days=monday.weekday())
+        sunday = monday + datetime.timedelta(days=6)
+        return monday, sunday
+    except ValueError:
+        return None
+
+def render_week_minutes_banner(week_range):
+    """Show minutes for a specific week prominently — called when ?week= param present."""
+    monday, sunday = week_range
+    week_label = f"{monday.strftime('%-d %b')} – {sunday.strftime('%-d %b %Y')}"
+
+    st.markdown(f"""
+    <div style="background:linear-gradient(135deg,#1a2e44,#2d4f72);border-radius:14px;
+                padding:18px 24px;margin-bottom:20px;">
+      <div style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;
+                  color:rgba(255,255,255,0.55);margin-bottom:4px;">🔗 Linked from Digital Staff Meeting</div>
+      <div style="font-size:20px;font-weight:800;color:white;">Formal Minutes — Week of {week_label}</div>
+      <div style="font-size:13px;color:rgba(255,255,255,0.65);margin-top:4px;">
+        Showing all meeting minutes recorded for this week across all programs.
+      </div>
+    </div>""", unsafe_allow_html=True)
+
+    # Search all programs for minutes in this week range
+    all_minutes = supabase.table("tm_minutes").select("*") \
+        .gte("meeting_date", str(monday)) \
+        .lte("meeting_date", str(sunday)) \
+        .order("meeting_date").execute().data or []
+
+    if not all_minutes:
+        st.info(f"No formal minutes recorded for the week of {week_label}.")
+    else:
+        for m in all_minutes:
+            prog = m.get("program", "")
+            prog_info = PROGRAMS.get(prog, {"label": prog, "color": "#666", "emoji": "📝"})
+            with st.expander(
+                f"{prog_info['emoji']} {prog_info['label']} — {m.get('meeting_date','')} · {m.get('title','Untitled')}",
+                expanded=True
+            ):
+                st.markdown(m.get("content", "No content recorded."))
+                if m.get("action_summary"):
+                    st.info(f"**Actions:** {m['action_summary']}")
+
+    st.markdown("---")
+    st.markdown('<div style="font-size:13px;color:#6b7280;margin-bottom:16px;">↓ Continue to full Team Meetings app below</div>', unsafe_allow_html=True)
+
 def admin_login():
     if "admin" not in st.session_state:
         st.session_state.admin = False
@@ -518,6 +571,11 @@ def main():
     prog_info = PROGRAMS[program]
 
     admin_login()
+
+    # ── Week cross-reference banner (when linked from Digital Staff Meeting) ──
+    week_range = get_week_from_params()
+    if week_range:
+        render_week_minutes_banner(week_range)
 
     # ── Header ──
     grad_end = {
