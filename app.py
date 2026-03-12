@@ -3,6 +3,13 @@ from supabase import create_client
 import datetime
 from groq import Groq
 import json
+import io
+from docx import Document
+from docx.shared import Pt, RGBColor, Inches, Cm
+from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.enum.table import WD_TABLE_ALIGNMENT, WD_ALIGN_VERTICAL
+from docx.oxml.ns import qn
+from docx.oxml import OxmlElement
 
 # ── Page config ──────────────────────────────────────────────────────────────
 st.set_page_config(page_title="CLC Team Meetings", page_icon="👥", layout="wide")
@@ -114,8 +121,346 @@ def delete_row(table, row_id):
     supabase.table(table).delete().eq("id", row_id).execute()
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SECTION RENDERERS
+# WORD DOCUMENT GENERATION
 # ─────────────────────────────────────────────────────────────────────────────
+
+def _set_cell_bg(cell, hex_colour):
+    """Set background colour of a table cell."""
+    tc   = cell._tc
+    tcPr = tc.get_or_add_tcPr()
+    shd  = OxmlElement("w:shd")
+    shd.set(qn("w:val"),   "clear")
+    shd.set(qn("w:color"), "auto")
+    shd.set(qn("w:fill"),  hex_colour)
+    tcPr.append(shd)
+
+def _set_col_width(table, col_idx, width_cm):
+    for row in table.rows:
+        row.cells[col_idx].width = Cm(width_cm)
+
+def _heading_para(doc, text, level=1, colour="1e293b"):
+    p   = doc.add_paragraph()
+    run = p.add_run(text)
+    run.bold      = True
+    run.font.size = Pt(14 if level == 1 else 12 if level == 2 else 11)
+    run.font.color.rgb = RGBColor.from_string(colour)
+    p.paragraph_format.space_before = Pt(10 if level == 1 else 6)
+    p.paragraph_format.space_after  = Pt(4)
+    return p
+
+def _section_divider(doc, title, bg_hex="1e293b", text_hex="FFFFFF"):
+    """Full-width dark banner acting as a section separator."""
+    table = doc.add_table(rows=1, cols=1)
+    table.alignment = WD_TABLE_ALIGNMENT.CENTER
+    cell = table.cell(0, 0)
+    _set_cell_bg(cell, bg_hex)
+    p   = cell.paragraphs[0]
+    run = p.add_run(f"  {title}  ")
+    run.bold           = True
+    run.font.size      = Pt(12)
+    run.font.color.rgb = RGBColor.from_string(text_hex)
+    p.alignment        = WD_ALIGN_PARAGRAPH.LEFT
+    cell.vertical_alignment = WD_ALIGN_VERTICAL.CENTER
+    p.paragraph_format.space_before = Pt(4)
+    p.paragraph_format.space_after  = Pt(4)
+    doc.add_paragraph()  # spacer
+
+def _info_table(doc, rows_data, header_bg="334155", header_text="FFFFFF"):
+    """Two-column key/value info table."""
+    table = doc.add_table(rows=len(rows_data), cols=2)
+    table.style = "Table Grid"
+    for i, (key, val) in enumerate(rows_data):
+        lc = table.cell(i, 0)
+        rc = table.cell(i, 1)
+        _set_cell_bg(lc, header_bg if i == 0 else "f1f5f9")
+        _set_cell_bg(rc, header_bg if i == 0 else "FFFFFF")
+        lr = lc.paragraphs[0].add_run(key)
+        lr.bold           = True
+        lr.font.size      = Pt(10)
+        lr.font.color.rgb = RGBColor.from_string(header_text if i == 0 else "0f172a")
+        rr = rc.paragraphs[0].add_run(val)
+        rr.font.size      = Pt(10)
+        rr.font.color.rgb = RGBColor.from_string(header_text if i == 0 else "0f172a")
+    _set_col_width(table, 0, 5)
+    _set_col_width(table, 1, 11)
+    doc.add_paragraph()
+
+def _attendees_table(doc, present_list, apology_list):
+    """Side-by-side attendees / apologies table."""
+    table = doc.add_table(rows=1 + max(len(present_list), len(apology_list), 1), cols=2)
+    table.style = "Table Grid"
+    # Headers
+    for ci, (txt, bg) in enumerate([("✅  Present", "2d7d4f"), ("⚠️  Apologies", "92400e")]):
+        cell = table.cell(0, ci)
+        _set_cell_bg(cell, bg)
+        run = cell.paragraphs[0].add_run(txt)
+        run.bold           = True
+        run.font.size      = Pt(10)
+        run.font.color.rgb = RGBColor.from_string("FFFFFF")
+    # Data rows
+    max_rows = max(len(present_list), len(apology_list), 1)
+    for ri in range(max_rows):
+        p_name = present_list[ri]  if ri < len(present_list)  else ""
+        a_name = apology_list[ri] if ri < len(apology_list) else ""
+        for ci, name in enumerate([p_name, a_name]):
+            cell = table.cell(ri + 1, ci)
+            _set_cell_bg(cell, "f8fafc")
+            run = cell.paragraphs[0].add_run(name)
+            run.font.size = Pt(10)
+    _set_col_width(table, 0, 8)
+    _set_col_width(table, 1, 8)
+    doc.add_paragraph()
+
+def _digital_actions_table(doc, items):
+    """Table of digital meeting items with viewed/actioned status."""
+    if not items:
+        doc.add_paragraph("No items recorded from digital staff meeting.", style="Normal")
+        doc.add_paragraph()
+        return
+    cols = ["Item / Notice", "Raised By", "Actioned By", "Status"]
+    table = doc.add_table(rows=1 + len(items), cols=len(cols))
+    table.style = "Table Grid"
+    # Header row
+    for ci, col_name in enumerate(cols):
+        cell = table.cell(0, ci)
+        _set_cell_bg(cell, "1e3a5f")
+        run = cell.paragraphs[0].add_run(col_name)
+        run.bold           = True
+        run.font.size      = Pt(9)
+        run.font.color.rgb = RGBColor.from_string("FFFFFF")
+    # Data rows
+    for ri, item in enumerate(items):
+        row_bg = "f8fafc" if ri % 2 == 0 else "FFFFFF"
+        status = item.get("status", "Noted")
+        status_bg = "d1fae5" if "action" in status.lower() else "fef3c7" if "noted" in status.lower() else "f8fafc"
+        for ci, val in enumerate([
+            item.get("item", ""),
+            item.get("raised_by", ""),
+            item.get("actioned_by", ""),
+            status
+        ]):
+            cell = table.cell(ri + 1, ci)
+            _set_cell_bg(cell, status_bg if ci == 3 else row_bg)
+            run = cell.paragraphs[0].add_run(str(val))
+            run.font.size = Pt(9)
+    widths = [8.5, 3.5, 3.5, 2.5]
+    for ci, w in enumerate(widths):
+        _set_col_width(table, ci, w)
+    doc.add_paragraph()
+
+def _actions_summary_table(doc, action_text):
+    """Render action items summary as a formatted table."""
+    if not action_text.strip():
+        return
+    _heading_para(doc, "Action Items Summary", level=2, colour="7c3aed")
+    table = doc.add_table(rows=1, cols=3)
+    table.style = "Table Grid"
+    for ci, hdr in enumerate(["Action", "Assigned To", "Due"]):
+        cell = table.cell(0, ci)
+        _set_cell_bg(cell, "5b21b6")
+        run = cell.paragraphs[0].add_run(hdr)
+        run.bold           = True
+        run.font.size      = Pt(10)
+        run.font.color.rgb = RGBColor.from_string("FFFFFF")
+    lines = [l.strip() for l in action_text.splitlines() if l.strip()]
+    for li, line in enumerate(lines):
+        parts = [p.strip() for p in line.split("|")]
+        row = table.add_row()
+        bg  = "f5f3ff" if li % 2 == 0 else "FFFFFF"
+        for ci in range(3):
+            val  = parts[ci] if ci < len(parts) else ""
+            cell = row.cells[ci]
+            _set_cell_bg(cell, bg)
+            run = cell.paragraphs[0].add_run(val)
+            run.font.size = Pt(9)
+    _set_col_width(table, 0, 9)
+    _set_col_width(table, 1, 4)
+    _set_col_width(table, 2, 3)
+    doc.add_paragraph()
+
+def generate_meeting_docx(
+    program: str,
+    meeting_date: str,
+    chair: str,
+    location: str,
+    present: list,
+    apologies: list,
+    digital_summary: str,
+    digital_items: list,
+    face_to_face_content: str,
+    action_summary: str,
+    title: str = ""
+) -> bytes:
+    """Generate a fully formatted Word document for a combined staff meeting."""
+    doc  = Document()
+    prog = PROGRAMS[program]
+
+    # ── Page margins ──────────────────────────────────────────────────────────
+    for section in doc.sections:
+        section.top_margin    = Cm(2)
+        section.bottom_margin = Cm(2)
+        section.left_margin   = Cm(2.5)
+        section.right_margin  = Cm(2.5)
+
+    # ── Cover header ──────────────────────────────────────────────────────────
+    header_table = doc.add_table(rows=1, cols=1)
+    header_cell  = header_table.cell(0, 0)
+    _set_cell_bg(header_cell, "0f172a")
+    hp = header_cell.paragraphs[0]
+    run = hp.add_run(f"  Cowandilla Learning Centre — Learning & Behaviour Unit")
+    run.bold           = True
+    run.font.size      = Pt(11)
+    run.font.color.rgb = RGBColor.from_string("94a3b8")
+    hp.paragraph_format.space_before = Pt(6)
+    hp.paragraph_format.space_after  = Pt(2)
+    hp2 = header_cell.add_paragraph()
+    r2  = hp2.add_run(f"  {title or prog['label'] + ' Meeting Minutes'}")
+    r2.bold           = True
+    r2.font.size      = Pt(16)
+    r2.font.color.rgb = RGBColor.from_string("FFFFFF")
+    hp2.paragraph_format.space_before = Pt(2)
+    hp2.paragraph_format.space_after  = Pt(8)
+    doc.add_paragraph()
+
+    # ── Meeting details table ─────────────────────────────────────────────────
+    _section_divider(doc, "📋  MEETING DETAILS", bg_hex="1e3a5f")
+    _info_table(doc, [
+        ("Field", "Details"),
+        ("Program", prog["label"]),
+        ("Date", meeting_date),
+        ("Chair", chair or "—"),
+        ("Location", location or "—"),
+    ])
+
+    # ── Attendees ─────────────────────────────────────────────────────────────
+    _section_divider(doc, "🙋  ATTENDANCE", bg_hex="1e3a5f")
+    _attendees_table(doc, present, apologies)
+
+    # ── Digital Staff Meeting section ─────────────────────────────────────────
+    _section_divider(doc, "💻  PART 1 — DIGITAL STAFF MEETING", bg_hex="1a4d8c")
+    if digital_summary.strip():
+        _heading_para(doc, "Digital Meeting Summary", level=2, colour="1a4d8c")
+        for line in digital_summary.strip().splitlines():
+            if line.strip():
+                p = doc.add_paragraph(line.strip(), style="Normal")
+                p.paragraph_format.space_after = Pt(2)
+        doc.add_paragraph()
+
+    _heading_para(doc, "Items Raised — Viewed & Actioned", level=2, colour="1a4d8c")
+    _digital_actions_table(doc, digital_items)
+
+    # ── Face-to-Face section ──────────────────────────────────────────────────
+    _section_divider(doc, "👥  PART 2 — FACE-TO-FACE MEETING", bg_hex="2d7d4f")
+    if face_to_face_content.strip():
+        for line in face_to_face_content.strip().splitlines():
+            if line.strip():
+                p = doc.add_paragraph(line.strip(), style="Normal")
+                p.paragraph_format.space_after = Pt(2)
+        doc.add_paragraph()
+    else:
+        doc.add_paragraph("No face-to-face minutes recorded.", style="Normal")
+        doc.add_paragraph()
+
+    # ── Action items ──────────────────────────────────────────────────────────
+    if action_summary.strip():
+        _section_divider(doc, "✅  ACTION ITEMS", bg_hex="5b21b6")
+        _actions_summary_table(doc, action_summary)
+
+    # ── Footer ────────────────────────────────────────────────────────────────
+    footer_table = doc.add_table(rows=1, cols=1)
+    fc = footer_table.cell(0, 0)
+    _set_cell_bg(fc, "f1f5f9")
+    fp = fc.paragraphs[0]
+    fr = fp.add_run(f"  Generated: {datetime.datetime.now().strftime('%d %b %Y, %I:%M %p')}  |  CLC Learning & Behaviour Unit  |  CONFIDENTIAL")
+    fr.font.size      = Pt(8)
+    fr.font.color.rgb = RGBColor.from_string("64748b")
+    fr.italic         = True
+
+    buf = io.BytesIO()
+    doc.save(buf)
+    buf.seek(0)
+    return buf.getvalue()
+
+
+def generate_simple_minutes_docx(
+    program: str,
+    meeting_date: str,
+    chair: str,
+    location: str,
+    present: list,
+    apologies: list,
+    content: str,
+    action_summary: str,
+    title: str = ""
+) -> bytes:
+    """Generate a Word doc for JP/PY/SY team meeting minutes (no digital section)."""
+    doc  = Document()
+    prog = PROGRAMS[program]
+
+    for section in doc.sections:
+        section.top_margin    = Cm(2)
+        section.bottom_margin = Cm(2)
+        section.left_margin   = Cm(2.5)
+        section.right_margin  = Cm(2.5)
+
+    # Header
+    header_table = doc.add_table(rows=1, cols=1)
+    header_cell  = header_table.cell(0, 0)
+    _set_cell_bg(header_cell, "0f172a")
+    hp = header_cell.paragraphs[0]
+    run = hp.add_run("  Cowandilla Learning Centre — Learning & Behaviour Unit")
+    run.bold = True; run.font.size = Pt(11)
+    run.font.color.rgb = RGBColor.from_string("94a3b8")
+    hp.paragraph_format.space_before = Pt(6)
+    hp.paragraph_format.space_after  = Pt(2)
+    hp2 = header_cell.add_paragraph()
+    r2  = hp2.add_run(f"  {title or prog['label'] + ' Team Meeting'}")
+    r2.bold = True; r2.font.size = Pt(16)
+    r2.font.color.rgb = RGBColor.from_string("FFFFFF")
+    hp2.paragraph_format.space_before = Pt(2)
+    hp2.paragraph_format.space_after  = Pt(8)
+    doc.add_paragraph()
+
+    prog_colours = {"JP": "2d7d4f", "PY": "1a4d8c", "SY": "7c3aed", "STAFF": "1e6f75", "ADMIN": "92400e"}
+    col = prog_colours.get(program, "1e293b")
+
+    _section_divider(doc, "📋  MEETING DETAILS", bg_hex=col)
+    _info_table(doc, [
+        ("Field", "Details"),
+        ("Program", prog["label"]),
+        ("Date", meeting_date),
+        ("Chair", chair or "—"),
+        ("Location", location or "—"),
+    ])
+
+    _section_divider(doc, "🙋  ATTENDANCE", bg_hex=col)
+    _attendees_table(doc, present, apologies)
+
+    _section_divider(doc, "📝  MEETING MINUTES", bg_hex=col)
+    if content.strip():
+        for line in content.strip().splitlines():
+            if line.strip():
+                p = doc.add_paragraph(line.strip(), style="Normal")
+                p.paragraph_format.space_after = Pt(2)
+        doc.add_paragraph()
+    else:
+        doc.add_paragraph("No minutes recorded.", style="Normal")
+
+    if action_summary.strip():
+        _section_divider(doc, "✅  ACTION ITEMS", bg_hex="5b21b6")
+        _actions_summary_table(doc, action_summary)
+
+    footer_table = doc.add_table(rows=1, cols=1)
+    fc = footer_table.cell(0, 0)
+    _set_cell_bg(fc, "f1f5f9")
+    fp = fc.paragraphs[0]
+    fr = fp.add_run(f"  Generated: {datetime.datetime.now().strftime('%d %b %Y, %I:%M %p')}  |  CLC Learning & Behaviour Unit  |  CONFIDENTIAL")
+    fr.font.size = Pt(8); fr.font.color.rgb = RGBColor.from_string("64748b"); fr.italic = True
+
+    buf = io.BytesIO()
+    doc.save(buf)
+    buf.seek(0)
+    return buf.getvalue()
 
 def render_schedules(program):
     """Meeting schedule management — recurring + additional."""
@@ -285,12 +630,12 @@ def render_agenda(program):
 
 
 def render_minutes(program, week_range=None):
-    """Minutes — admin only to create/edit, all can view."""
+    """Minutes — rich combined view for STAFF, clean team minutes for JP/PY/SY."""
     st.subheader("📝 Meeting Minutes")
 
     minutes_list = fetch("tm_minutes", {"program": program}, "meeting_date")
 
-    # If linked from digital staff meeting, show a subtle notice
+    # Linked-week notice
     if week_range:
         monday, sunday = week_range
         week_str = f"{monday.strftime('%-d %b')} – {sunday.strftime('%-d %b %Y')}"
@@ -300,10 +645,9 @@ def render_minutes(program, week_range=None):
           🔗 <strong>Linked from Digital Staff Meeting</strong> — showing minutes for week of {week_str}
         </div>""", unsafe_allow_html=True)
 
-    # ── View existing minutes ──
+    # ── View existing minutes ─────────────────────────────────────────────────
     if minutes_list:
         for m in minutes_list:
-            # Auto-expand if this record falls within the linked week
             auto_expand = False
             if week_range:
                 try:
@@ -312,17 +656,123 @@ def render_minutes(program, week_range=None):
                 except (ValueError, KeyError):
                     pass
 
+            is_staff = program == "STAFF"
+
             with st.expander(
                 f"📄 {m.get('meeting_date','')} — {m.get('title','Untitled')}",
                 expanded=auto_expand
             ):
-                st.markdown(m.get("content", "No content recorded."))
+                # Meeting meta
+                meta_cols = st.columns(3)
+                with meta_cols[0]: st.caption(f"**Chair:** {m.get('chair','—')}")
+                with meta_cols[1]: st.caption(f"**Location:** {m.get('location','—')}")
+                with meta_cols[2]: st.caption(f"**Date:** {m.get('meeting_date','—')}")
+
+                # Attendees
+                if m.get("attendees") or m.get("apologies"):
+                    att_cols = st.columns(2)
+                    with att_cols[0]:
+                        st.markdown("**✅ Present**")
+                        for name in (m.get("attendees") or "").split(","):
+                            if name.strip(): st.markdown(f"- {name.strip()}")
+                    with att_cols[1]:
+                        st.markdown("**⚠️ Apologies**")
+                        for name in (m.get("apologies") or "").split(","):
+                            if name.strip(): st.markdown(f"- {name.strip()}")
+                    st.divider()
+
+                # Digital section (STAFF only)
+                if is_staff and m.get("digital_summary"):
+                    st.markdown("""
+                    <div style="background:#dbeafe;border-left:4px solid #1a4d8c;
+                                border-radius:6px;padding:10px 14px;margin-bottom:10px;">
+                      <strong style="color:#1a4d8c;">💻 Part 1 — Digital Staff Meeting</strong>
+                    </div>""", unsafe_allow_html=True)
+                    st.markdown(m["digital_summary"])
+
+                    if m.get("digital_items"):
+                        st.markdown("**Items — Viewed & Actioned**")
+                        try:
+                            items = json.loads(m["digital_items"])
+                            if items:
+                                cols = st.columns([4, 2, 2, 1.5])
+                                headers = ["Item / Notice", "Raised By", "Actioned By", "Status"]
+                                for col, hdr in zip(cols, headers):
+                                    col.markdown(f"**{hdr}**")
+                                st.divider()
+                                for item in items:
+                                    ic = st.columns([4, 2, 2, 1.5])
+                                    ic[0].write(item.get("item", ""))
+                                    ic[1].write(item.get("raised_by", ""))
+                                    ic[2].write(item.get("actioned_by", ""))
+                                    status = item.get("status", "Noted")
+                                    color  = "🟢" if "action" in status.lower() else "🟡"
+                                    ic[3].write(f"{color} {status}")
+                        except Exception:
+                            st.markdown(m["digital_items"])
+                    st.divider()
+
+                # Main content
+                if is_staff and m.get("face_to_face_content"):
+                    st.markdown("""
+                    <div style="background:#d1fae5;border-left:4px solid #2d7d4f;
+                                border-radius:6px;padding:10px 14px;margin-bottom:10px;">
+                      <strong style="color:#2d7d4f;">👥 Part 2 — Face-to-Face Meeting</strong>
+                    </div>""", unsafe_allow_html=True)
+                    st.markdown(m.get("face_to_face_content", ""))
+                elif m.get("content"):
+                    st.markdown(m["content"])
+
                 if m.get("action_summary"):
                     st.info(f"**Actions:** {m['action_summary']}")
+
+                # Download button
+                st.markdown("")
+                if is_staff:
+                    try:
+                        digital_items = json.loads(m.get("digital_items") or "[]")
+                    except Exception:
+                        digital_items = []
+                    docx_bytes = generate_meeting_docx(
+                        program       = program,
+                        meeting_date  = m.get("meeting_date", ""),
+                        chair         = m.get("chair", ""),
+                        location      = m.get("location", ""),
+                        present       = [n.strip() for n in (m.get("attendees") or "").split(",") if n.strip()],
+                        apologies     = [n.strip() for n in (m.get("apologies") or "").split(",") if n.strip()],
+                        digital_summary     = m.get("digital_summary", ""),
+                        digital_items       = digital_items,
+                        face_to_face_content= m.get("face_to_face_content", ""),
+                        action_summary      = m.get("action_summary", ""),
+                        title               = m.get("title", ""),
+                    )
+                else:
+                    docx_bytes = generate_simple_minutes_docx(
+                        program      = program,
+                        meeting_date = m.get("meeting_date", ""),
+                        chair        = m.get("chair", ""),
+                        location     = m.get("location", ""),
+                        present      = [n.strip() for n in (m.get("attendees") or "").split(",") if n.strip()],
+                        apologies    = [n.strip() for n in (m.get("apologies") or "").split(",") if n.strip()],
+                        content      = m.get("content", ""),
+                        action_summary = m.get("action_summary", ""),
+                        title        = m.get("title", ""),
+                    )
+                safe_title = (m.get("title") or "minutes").replace(" ", "_")
+                st.download_button(
+                    label    = "📥 Download Word Document",
+                    data     = docx_bytes,
+                    file_name= f"{safe_title}_{m.get('meeting_date','')}.docx",
+                    mime     = "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    key      = f"dl_{m['id']}"
+                )
+
+                # Admin edit / delete
                 if st.session_state.get("admin"):
+                    st.divider()
                     col1, col2 = st.columns(2)
                     with col1:
-                        if st.button("✏️ Edit Minutes", key=f"edit_min_{m['id']}"):
+                        if st.button("✏️ Edit", key=f"edit_min_{m['id']}"):
                             st.session_state[f"editing_min_{m['id']}"] = True
                     with col2:
                         if st.button("🗑️ Delete", key=f"del_min_{m['id']}"):
@@ -330,67 +780,246 @@ def render_minutes(program, week_range=None):
                             st.rerun()
                     if st.session_state.get(f"editing_min_{m['id']}"):
                         with st.form(f"edit_min_form_{m['id']}"):
-                            etitle = st.text_input("Title", value=m.get("title",""))
-                            edate  = st.date_input("Date", value=datetime.date.fromisoformat(m["meeting_date"]) if m.get("meeting_date") else datetime.date.today())
-                            econtent = st.text_area("Minutes content", value=m.get("content",""), height=300)
+                            etitle   = st.text_input("Title", value=m.get("title",""))
+                            edate    = st.date_input("Date", value=datetime.date.fromisoformat(m["meeting_date"]) if m.get("meeting_date") else datetime.date.today())
+                            echair   = st.text_input("Chair", value=m.get("chair",""))
+                            eloc     = st.text_input("Location", value=m.get("location",""))
+                            eatt     = st.text_input("Attendees (comma-separated)", value=m.get("attendees",""))
+                            eapol    = st.text_input("Apologies (comma-separated)", value=m.get("apologies",""))
+                            if program == "STAFF":
+                                edigital = st.text_area("Digital meeting summary", value=m.get("digital_summary",""), height=150)
+                                eff      = st.text_area("Face-to-face minutes", value=m.get("face_to_face_content",""), height=200)
+                                econtent = ""
+                            else:
+                                edigital = ""; eff = ""
+                                econtent = st.text_area("Minutes", value=m.get("content",""), height=300)
                             eactions = st.text_area("Action summary", value=m.get("action_summary",""))
                             if st.form_submit_button("Save"):
                                 update_row("tm_minutes", m["id"], {
                                     "title": etitle, "meeting_date": str(edate),
-                                    "content": econtent, "action_summary": eactions
+                                    "chair": echair, "location": eloc,
+                                    "attendees": eatt, "apologies": eapol,
+                                    "digital_summary": edigital,
+                                    "face_to_face_content": eff,
+                                    "content": econtent,
+                                    "action_summary": eactions
                                 })
                                 del st.session_state[f"editing_min_{m['id']}"]
                                 st.rerun()
     else:
         st.info("No minutes recorded yet.")
 
-    # ── Record new minutes (admin only) ──
-    if st.session_state.get("admin"):
-        st.divider()
-        st.subheader("✍️ Record New Minutes")
+    # ── Record new minutes (admin only) ──────────────────────────────────────
+    if not st.session_state.get("admin"):
+        return
 
-        input_method = st.radio("Input method", ["📄 Type / paste minutes directly", "🎙️ Drop transcript — AI will improve it"], horizontal=True)
+    st.divider()
 
-        with st.form("new_minutes_form"):
-            m_title = st.text_input("Meeting title", placeholder="e.g. JP Team Meeting — Term 1 Week 4")
-            m_date  = st.date_input("Meeting date", value=datetime.date.today())
+    if program == "STAFF":
+        _render_new_staff_minutes()
+    else:
+        _render_new_team_minutes(program)
 
-            schedules = fetch("tm_schedules", {"program": program})
-            sched_opts = {s["schedule_name"]: s["id"] for s in schedules}
-            sched_opts["General / Unassigned"] = None
-            m_sched = st.selectbox("Associated schedule", list(sched_opts.keys()))
 
-            if "📄" in input_method:
-                m_content = st.text_area("Minutes", height=350, placeholder="Type or paste your meeting minutes here...")
-                do_ai = False
+def _render_new_staff_minutes():
+    """New combined staff meeting minutes form (digital + face-to-face)."""
+    st.subheader("✍️ Record Combined Staff Meeting Minutes")
+
+    st.markdown("""
+    <div style="background:#f0f9ff;border:1px solid #bae6fd;border-radius:8px;
+                padding:12px 16px;margin-bottom:16px;font-size:13px;color:#0c4a6e;">
+      📋 This form combines the <strong>Digital Staff Meeting</strong> section
+      (items raised online + who actioned them) with the <strong>Face-to-Face</strong>
+      section into one unified, downloadable document.
+    </div>""", unsafe_allow_html=True)
+
+    with st.form("new_staff_minutes_form"):
+        st.markdown("#### 📋 Meeting Details")
+        c1, c2, c3 = st.columns(3)
+        with c1: m_title = st.text_input("Meeting title *", placeholder="e.g. Staff Meeting — T1 W4")
+        with c2: m_date  = st.date_input("Date *", value=datetime.date.today())
+        with c3: m_chair = st.text_input("Chair", placeholder="e.g. Candice Cooper")
+        m_location = st.text_input("Location", placeholder="e.g. Staff Room / Teams")
+
+        st.markdown("#### 🙋 Attendance")
+        att_c1, att_c2 = st.columns(2)
+        with att_c1:
+            m_attendees = st.text_area("Present (one per line or comma-separated)",
+                                       placeholder="e.g.\nCandice Cooper\nJane Smith", height=100)
+        with att_c2:
+            m_apologies = st.text_area("Apologies (one per line or comma-separated)",
+                                       placeholder="e.g.\nBob Jones", height=100)
+
+        st.markdown("#### 💻 Part 1 — Digital Staff Meeting")
+        m_digital_summary = st.text_area(
+            "Digital meeting summary (paste or type overview of online notices/discussion)",
+            placeholder="e.g. Staff reviewed 4 notices this week: timetable update, PD day reminder, student transport change, and health & safety reminder.",
+            height=100
+        )
+
+        st.markdown("**Items raised — add each row below (Item | Raised By | Actioned By | Status)**")
+        st.caption("Enter one item per line in format: Item description | Raised By | Actioned By | Status (e.g. Actioned / Noted / Pending)")
+        m_digital_items_raw = st.text_area(
+            "Digital items table",
+            placeholder="Timetable update for Week 5 | Candice Cooper | All staff | Noted\nStudent transport change — JP | Admin | JP team | Actioned\nPD Day reminder 14 March | Candice Cooper | All staff | Actioned",
+            height=120
+        )
+
+        st.markdown("#### 👥 Part 2 — Face-to-Face Meeting")
+        ff_method = st.radio(
+            "Input method",
+            ["📄 Type / paste minutes directly", "🎙️ Drop transcript — AI will improve it"],
+            horizontal=True
+        )
+        m_ff_content = st.text_area(
+            "Face-to-face minutes" if "📄" in ff_method else "Paste transcript or rough notes",
+            height=300,
+            placeholder="Type your face-to-face meeting minutes here..." if "📄" in ff_method
+            else "Paste the recorded transcript or rough notes here. AI will structure and polish them."
+        )
+        do_ai = "🎙️" in ff_method
+
+        st.markdown("#### ✅ Action Items")
+        m_actions = st.text_area(
+            "Action items (one per line: Action | Assigned To | Due date)",
+            placeholder="Update student profiles | Candice Cooper | Week 5\nBook PD venue | Admin | 14 March",
+            height=80
+        )
+
+        submitted = st.form_submit_button(
+            "✨ Improve with AI & Save" if do_ai else "💾 Save Combined Minutes",
+            type="primary"
+        )
+
+        if submitted:
+            if not m_title.strip():
+                st.warning("Please enter a meeting title.")
             else:
-                m_content = st.text_area("Paste transcript or rough notes", height=350,
-                                          placeholder="Paste the transcript or your rough notes here. AI will structure and improve them into polished minutes.")
-                do_ai = True
+                # Parse attendees
+                attendees_str = ", ".join([
+                    n.strip() for n in
+                    (m_attendees.replace("\n", ",").split(","))
+                    if n.strip()
+                ])
+                apologies_str = ", ".join([
+                    n.strip() for n in
+                    (m_apologies.replace("\n", ",").split(","))
+                    if n.strip()
+                ])
 
-            m_actions = st.text_area("Action items summary (optional — leave blank to auto-extract from minutes)",
-                                      placeholder="e.g. Update student profiles – Candice – Week 3")
+                # Parse digital items
+                digital_items = []
+                for line in m_digital_items_raw.splitlines():
+                    parts = [p.strip() for p in line.split("|")]
+                    if parts and parts[0]:
+                        digital_items.append({
+                            "item":        parts[0] if len(parts) > 0 else "",
+                            "raised_by":   parts[1] if len(parts) > 1 else "",
+                            "actioned_by": parts[2] if len(parts) > 2 else "",
+                            "status":      parts[3] if len(parts) > 3 else "Noted",
+                        })
 
-            submitted = st.form_submit_button("💾 Save Minutes" if not do_ai else "✨ Improve with AI & Save")
+                # AI improvement
+                final_ff = m_ff_content.strip()
+                if do_ai and final_ff:
+                    with st.spinner("AI is improving your minutes…"):
+                        final_ff = improve_with_ai(final_ff, "STAFF", str(m_date))
 
-            if submitted:
-                if m_title.strip() and m_content.strip():
-                    final_content = m_content.strip()
-                    if do_ai:
-                        with st.spinner("Claude is improving your minutes…"):
-                            final_content = improve_with_ai(final_content, program, str(m_date))
-                    insert("tm_minutes", {
-                        "program": program,
-                        "schedule_id": sched_opts.get(m_sched),
-                        "title": m_title.strip(),
-                        "meeting_date": str(m_date),
-                        "content": final_content,
-                        "action_summary": m_actions.strip()
-                    })
-                    st.success("Minutes saved!")
-                    st.rerun()
-                else:
-                    st.warning("Please enter a title and content.")
+                insert("tm_minutes", {
+                    "program":             "STAFF",
+                    "title":               m_title.strip(),
+                    "meeting_date":        str(m_date),
+                    "chair":               m_chair.strip(),
+                    "location":            m_location.strip(),
+                    "attendees":           attendees_str,
+                    "apologies":           apologies_str,
+                    "digital_summary":     m_digital_summary.strip(),
+                    "digital_items":       json.dumps(digital_items),
+                    "face_to_face_content": final_ff,
+                    "content":             "",
+                    "action_summary":      m_actions.strip(),
+                })
+                st.success("✅ Combined meeting minutes saved!")
+                st.rerun()
+
+
+def _render_new_team_minutes(program):
+    """New minutes form for JP/PY/SY team meetings."""
+    st.subheader("✍️ Record New Minutes")
+
+    input_method = st.radio(
+        "Input method",
+        ["📄 Type / paste minutes directly", "🎙️ Drop transcript — AI will improve it"],
+        horizontal=True
+    )
+
+    with st.form("new_minutes_form"):
+        st.markdown("#### 📋 Meeting Details")
+        c1, c2, c3 = st.columns(3)
+        with c1: m_title = st.text_input("Meeting title *", placeholder=f"e.g. {PROGRAMS[program]['label']} Meeting — T1 W4")
+        with c2: m_date  = st.date_input("Date *", value=datetime.date.today())
+        with c3: m_chair = st.text_input("Chair", placeholder="e.g. Jane Smith")
+        m_location = st.text_input("Location", placeholder="e.g. Room 3 / Teams")
+
+        st.markdown("#### 🙋 Attendance")
+        att_c1, att_c2 = st.columns(2)
+        with att_c1:
+            m_attendees = st.text_area("Present (one per line or comma-separated)", height=90)
+        with att_c2:
+            m_apologies = st.text_area("Apologies (one per line or comma-separated)", height=90)
+
+        schedules  = fetch("tm_schedules", {"program": program})
+        sched_opts = {s["schedule_name"]: s["id"] for s in schedules}
+        sched_opts["General / Unassigned"] = None
+        m_sched = st.selectbox("Associated schedule", list(sched_opts.keys()))
+
+        st.markdown("#### 📝 Minutes")
+        if "📄" in input_method:
+            m_content = st.text_area("Minutes", height=300, placeholder="Type or paste your meeting minutes here...")
+            do_ai = False
+        else:
+            m_content = st.text_area("Paste transcript or rough notes", height=300,
+                                     placeholder="AI will structure and polish these into professional minutes.")
+            do_ai = True
+
+        m_actions = st.text_area(
+            "Action items (one per line: Action | Assigned To | Due date)",
+            placeholder="Update student profiles | Jane Smith | Week 5",
+            height=80
+        )
+
+        submitted = st.form_submit_button(
+            "✨ Improve with AI & Save" if do_ai else "💾 Save Minutes",
+            type="primary"
+        )
+
+        if submitted:
+            if not m_title.strip():
+                st.warning("Please enter a meeting title.")
+            else:
+                attendees_str = ", ".join([n.strip() for n in (m_attendees.replace("\n",",").split(",")) if n.strip()])
+                apologies_str = ", ".join([n.strip() for n in (m_apologies.replace("\n",",").split(",")) if n.strip()])
+                final_content = m_content.strip()
+                if do_ai and final_content:
+                    with st.spinner("AI is improving your minutes…"):
+                        final_content = improve_with_ai(final_content, program, str(m_date))
+                insert("tm_minutes", {
+                    "program":       program,
+                    "schedule_id":   sched_opts.get(m_sched),
+                    "title":         m_title.strip(),
+                    "meeting_date":  str(m_date),
+                    "chair":         m_chair.strip(),
+                    "location":      m_location.strip(),
+                    "attendees":     attendees_str,
+                    "apologies":     apologies_str,
+                    "content":       final_content,
+                    "action_summary": m_actions.strip(),
+                    "digital_summary": "",
+                    "digital_items":   "[]",
+                    "face_to_face_content": "",
+                })
+                st.success("✅ Minutes saved!")
+                st.rerun()
 
 
 def render_actions(program):
