@@ -125,6 +125,132 @@ def delete_row(table, row_id):
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION RENDERERS — SCHEDULES & AGENDA
+# ─────────────────────────────────────────────────────────────────────────────
+
+def render_schedules(program):
+    """Meeting schedules — recurring + additional one-offs."""
+    st.subheader("📅 Meeting Schedules")
+
+    schedules = fetch("tm_schedules", {"program": program}, "created_at")
+
+    if schedules:
+        for s in schedules:
+            rec_label = s.get("recurrence_type", "Weekly")
+            day_label = s.get("day_of_week", "")
+            time_label = s.get("meeting_time", "")
+            flags = []
+            if s.get("show_in_calendar"): flags.append("📅 Calendar")
+            if s.get("show_in_bulletin"): flags.append("📋 Bulletin")
+            flag_str = "  ·  ".join(flags) if flags else "No flags"
+
+            with st.expander(
+                f"📌 {s.get('schedule_name','Unnamed')} — {rec_label} {day_label} {time_label}",
+                expanded=False
+            ):
+                c1, c2, c3 = st.columns(3)
+                c1.markdown(f"**Recurrence:** {rec_label}")
+                c2.markdown(f"**Day/Time:** {day_label} {time_label}")
+                c3.markdown(f"**Flags:** {flag_str}")
+                if s.get("notes"):
+                    st.caption(s["notes"])
+                if st.session_state.get("admin"):
+                    col_e, col_d = st.columns(2)
+                    with col_d:
+                        if st.button("🗑️ Delete", key=f"del_sched_{s['id']}"):
+                            delete_row("tm_schedules", s["id"])
+                            st.rerun()
+    else:
+        st.info("No schedules set up yet.")
+
+    if st.session_state.get("admin"):
+        with st.expander("➕ Add Schedule"):
+            with st.form(f"sched_form_{program}"):
+                s_name = st.text_input("Schedule name *", placeholder="e.g. Weekly JP Team Meeting")
+                sc1, sc2, sc3 = st.columns(3)
+                with sc1:
+                    s_rec  = st.selectbox("Recurrence", RECURRENCE_TYPES)
+                with sc2:
+                    s_day  = st.selectbox("Day of week", DAYS_OF_WEEK)
+                with sc3:
+                    s_time = st.text_input("Time", placeholder="e.g. 9:00am")
+                s_cal  = st.checkbox("Show in Calendar")
+                s_bull = st.checkbox("Show in Bulletin")
+                s_notes = st.text_area("Notes (optional)", height=60)
+                if st.form_submit_button("Add Schedule"):
+                    if s_name.strip():
+                        insert("tm_schedules", {
+                            "program":          program,
+                            "schedule_name":    s_name.strip(),
+                            "recurrence_type":  s_rec,
+                            "day_of_week":      s_day,
+                            "meeting_time":     s_time.strip(),
+                            "show_in_calendar": s_cal,
+                            "show_in_bulletin": s_bull,
+                            "notes":            s_notes.strip(),
+                        })
+                        st.success("Schedule added!")
+                        st.rerun()
+                    else:
+                        st.warning("Please enter a schedule name.")
+
+
+def render_agenda(program):
+    """Agenda items — any staff can submit, admin manages status."""
+    st.subheader("📋 Agenda")
+
+    items = fetch("tm_agenda_items", {"program": program}, "created_at")
+
+    open_items  = [i for i in items if i.get("status","open") != "closed"]
+    closed_items = [i for i in items if i.get("status","open") == "closed"]
+
+    if open_items:
+        for item in open_items:
+            c1, c2 = st.columns([5, 1])
+            with c1:
+                st.markdown(f"📌 **{item['title']}**")
+                if item.get("description"):
+                    st.caption(item["description"])
+                st.caption(f"Submitted by {item.get('submitted_by','—')}  ·  {str(item.get('created_at',''))[:10]}")
+            with c2:
+                if st.session_state.get("admin"):
+                    if st.button("✅ Close", key=f"close_agenda_{item['id']}"):
+                        update_row("tm_agenda_items", item["id"], {"status": "closed"})
+                        st.rerun()
+                    if st.button("🗑️", key=f"del_agenda_{item['id']}"):
+                        delete_row("tm_agenda_items", item["id"])
+                        st.rerun()
+            st.divider()
+    else:
+        st.info("No open agenda items.")
+
+    if closed_items:
+        with st.expander(f"✅ Closed items ({len(closed_items)})"):
+            for item in closed_items:
+                st.markdown(f"~~{item['title']}~~ — {item.get('submitted_by','—')}")
+
+    with st.expander("➕ Submit an Agenda Item"):
+        with st.form(f"agenda_form_{program}"):
+            a_title = st.text_input("Item title *")
+            a_desc  = st.text_area("Description (optional)", height=80)
+            a_by    = st.text_input("Your name")
+            if st.form_submit_button("Submit"):
+                if a_title.strip():
+                    insert("tm_agenda_items", {
+                        "program":      program,
+                        "title":        a_title.strip(),
+                        "description":  a_desc.strip(),
+                        "submitted_by": a_by.strip(),
+                        "status":       "open",
+                    })
+                    st.success("Agenda item submitted!")
+                    st.rerun()
+                else:
+                    st.warning("Please enter a title.")
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # WORD DOCUMENT GENERATION
 # ─────────────────────────────────────────────────────────────────────────────
